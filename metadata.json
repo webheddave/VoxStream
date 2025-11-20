@@ -1,0 +1,7 @@
+{
+  "name": "VoxStream AI",
+  "description": "Real-time AI voice transformation and persona streaming using Gemini Live API.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
