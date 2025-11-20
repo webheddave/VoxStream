@@ -1,3 +1,4 @@
+
 export enum VoiceName {
   Puck = 'Puck',
   Charon = 'Charon',
@@ -14,6 +15,15 @@ export enum PersonaStyle {
   NewsAnchor = 'News Anchor',
 }
 
+export enum AudioFilter {
+  None = 'None',
+  Telephone = 'Telephone',
+  Space = 'Space',
+  Echo = 'Echo',
+  Robot = 'Robot',
+  OldRadio = 'Old Radio',
+}
+
 export interface StreamingState {
   isConnected: boolean;
   isConnecting: boolean;
@@ -24,4 +34,12 @@ export interface StreamingState {
 export interface AudioVisualizerProps {
   analyser: AnalyserNode | null;
   color: string;
+}
+
+export interface Preset {
+  id: string;
+  name: string;
+  voice: VoiceName;
+  persona: PersonaStyle;
+  filter: AudioFilter;
 }

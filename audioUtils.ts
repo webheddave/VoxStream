@@ -1,3 +1,4 @@
+
 import { Blob } from '@google/genai';
 
 export function base64ToBytes(base64: string): Uint8Array {
@@ -69,4 +70,34 @@ export function createPcmBlob(data: Float32Array, sampleRate: number = 16000): B
     data: bytesToBase64(new Uint8Array(int16.buffer)),
     mimeType: `audio/pcm;rate=${sampleRate}`,
   };
+}
+
+export function createImpulseResponse(context: AudioContext, duration: number, decay: number, reverse: boolean): AudioBuffer {
+  const sampleRate = context.sampleRate;
+  const length = sampleRate * duration;
+  const impulse = context.createBuffer(2, length, sampleRate);
+  const left = impulse.getChannelData(0);
+  const right = impulse.getChannelData(1);
+
+  for (let i = 0; i < length; i++) {
+    const n = reverse ? length - i : i;
+    // Simple white noise with exponential decay
+    left[i] = (Math.random() * 2 - 1) * Math.pow(1 - n / length, decay);
+    right[i] = (Math.random() * 2 - 1) * Math.pow(1 - n / length, decay);
+  }
+  return impulse;
+}
+
+export function makeDistortionCurve(amount: number): Float32Array {
+  const k = typeof amount === 'number' ? amount : 50;
+  const n_samples = 44100;
+  const curve = new Float32Array(n_samples);
+  const deg = Math.PI / 180;
+  
+  for (let i = 0; i < n_samples; ++i) {
+    const x = (i * 2) / n_samples - 1;
+    // Classic sigmoid distortion curve
+    curve[i] = (3 + k) * x * 20 * deg / (Math.PI + k * Math.abs(x));
+  }
+  return curve;
 }

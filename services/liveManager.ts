@@ -1,6 +1,7 @@
+
 import { GoogleGenAI, LiveSession, LiveServerMessage, Modality } from '@google/genai';
-import { createPcmBlob, base64ToBytes, decodeAudioData, resampleTo16k } from '../audioUtils';
-import { VoiceName, PersonaStyle } from '../types';
+import { createPcmBlob, base64ToBytes, decodeAudioData, resampleTo16k, createImpulseResponse, makeDistortionCurve } from '../audioUtils';
+import { VoiceName, PersonaStyle, AudioFilter } from '../types';
 
 export class LiveManager {
   private ai: GoogleGenAI | null = null;
@@ -9,9 +10,14 @@ export class LiveManager {
   private outputAudioContext: AudioContext | null = null;
   private inputSource: MediaStreamAudioSourceNode | null = null;
   private processor: ScriptProcessorNode | null = null;
+  
+  // Audio Graph for Output
+  private fxInput: GainNode | null = null;
   private outputNode: GainNode | null = null;
   private outputAnalyser: AnalyserNode | null = null;
   private inputAnalyser: AnalyserNode | null = null;
+  private activeFxNodes: AudioNode[] = [];
+  
   private nextStartTime: number = 0;
   private activeSources: Set<AudioBufferSourceNode> = new Set();
   
@@ -19,12 +25,13 @@ export class LiveManager {
   public onConnect: () => void = () => {};
   public onDisconnect: () => void = () => {};
   public onError: (error: string) => void = () => {};
+  public onTranscription: (text: string) => void = () => {};
 
   constructor() {
     // Initialization moved to connect()
   }
 
-  public async connect(voice: VoiceName, persona: PersonaStyle) {
+  public async connect(voice: VoiceName, persona: PersonaStyle, filter: AudioFilter) {
     try {
       // Initialize AI client right before connection to ensure API key is present and fresh
       this.ai = new GoogleGenAI({ apiKey: process.env.API_KEY as string });
@@ -39,9 +46,17 @@ export class LiveManager {
       
       this.outputAnalyser = this.outputAudioContext.createAnalyser();
       this.outputAnalyser.fftSize = 256;
+      
+      // Output Chain: Source -> FxInput -> [Effects] -> OutputNode (Vol) -> Analyser -> Dest
+      this.fxInput = this.outputAudioContext.createGain();
       this.outputNode = this.outputAudioContext.createGain();
+      
+      this.fxInput.connect(this.outputNode); // Default straight through
       this.outputNode.connect(this.outputAnalyser);
       this.outputAnalyser.connect(this.outputAudioContext.destination);
+
+      // Apply initial filter
+      this.setFilter(filter);
 
       // Get Mic Stream
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -57,6 +72,7 @@ export class LiveManager {
             voiceConfig: { prebuiltVoiceConfig: { voiceName: voice } },
           },
           systemInstruction: systemInstruction,
+          inputAudioTranscription: {}, // Enable transcription
         },
         callbacks: {
           onopen: this.handleOpen.bind(this, stream),
@@ -91,6 +107,130 @@ export class LiveManager {
       console.error("Connection setup failed", error);
       this.onError(error.message || 'Failed to access microphone or connect.');
       this.disconnect();
+    }
+  }
+
+  public setFilter(filter: AudioFilter) {
+    if (!this.outputAudioContext || !this.fxInput || !this.outputNode) return;
+
+    // 1. Disconnect current graph
+    this.fxInput.disconnect();
+    
+    // 2. Cleanup old nodes
+    this.activeFxNodes.forEach(node => {
+      try { node.disconnect(); } catch (e) {}
+    });
+    this.activeFxNodes = [];
+
+    const ctx = this.outputAudioContext;
+
+    // 3. Build new graph
+    switch (filter) {
+      case AudioFilter.Telephone:
+        // Bandpass 300-3000Hz + Distortion
+        const biquad = ctx.createBiquadFilter();
+        biquad.type = 'bandpass';
+        biquad.frequency.value = 1000;
+        biquad.Q.value = 1.0;
+        
+        const dist = ctx.createWaveShaper();
+        dist.curve = makeDistortionCurve(50);
+        
+        // Chain: Input -> Biquad -> Distortion -> Output
+        this.fxInput.connect(biquad);
+        biquad.connect(dist);
+        dist.connect(this.outputNode);
+        
+        this.activeFxNodes.push(biquad, dist);
+        break;
+
+      case AudioFilter.Space:
+        // Reverb
+        const convolver = ctx.createConvolver();
+        convolver.buffer = createImpulseResponse(ctx, 2, 2, false);
+        
+        const dryGain = ctx.createGain();
+        const wetGain = ctx.createGain();
+        dryGain.gain.value = 0.6;
+        wetGain.gain.value = 0.8;
+
+        // Parallel: Input -> Dry -> Output
+        //           Input -> Convolver -> Wet -> Output
+        this.fxInput.connect(dryGain);
+        dryGain.connect(this.outputNode);
+
+        this.fxInput.connect(convolver);
+        convolver.connect(wetGain);
+        wetGain.connect(this.outputNode);
+
+        this.activeFxNodes.push(convolver, dryGain, wetGain);
+        break;
+
+      case AudioFilter.Echo:
+        // Delay with Feedback
+        const delay = ctx.createDelay();
+        delay.delayTime.value = 0.3; // 300ms
+        
+        const feedback = ctx.createGain();
+        feedback.gain.value = 0.4;
+
+        // Input -> Output (Direct)
+        // Input -> Delay -> Output
+        // Delay -> Feedback -> Delay
+        this.fxInput.connect(this.outputNode);
+        this.fxInput.connect(delay);
+        delay.connect(this.outputNode);
+        delay.connect(feedback);
+        feedback.connect(delay);
+
+        this.activeFxNodes.push(delay, feedback);
+        break;
+
+      case AudioFilter.Robot:
+        // Ring Modulator
+        const osc = ctx.createOscillator();
+        osc.type = 'sawtooth';
+        osc.frequency.value = 50;
+        osc.start();
+
+        const ringGain = ctx.createGain();
+        ringGain.gain.value = 0; // Base gain 0, modulated by osc
+
+        // Connect Osc to Gain.gain
+        // Input connects to Gain
+        osc.connect(ringGain.gain);
+        
+        this.fxInput.connect(ringGain);
+        ringGain.connect(this.outputNode);
+        
+        this.activeFxNodes.push(osc, ringGain);
+        break;
+
+      case AudioFilter.OldRadio:
+        // Highpass + Distortion
+        const hp = ctx.createBiquadFilter();
+        hp.type = 'highpass';
+        hp.frequency.value = 600;
+        
+        const lp = ctx.createBiquadFilter();
+        lp.type = 'lowpass';
+        lp.frequency.value = 3000;
+
+        const radioDist = ctx.createWaveShaper();
+        radioDist.curve = makeDistortionCurve(100);
+
+        this.fxInput.connect(hp);
+        hp.connect(lp);
+        lp.connect(radioDist);
+        radioDist.connect(this.outputNode);
+
+        this.activeFxNodes.push(hp, lp, radioDist);
+        break;
+
+      case AudioFilter.None:
+      default:
+        this.fxInput.connect(this.outputNode);
+        break;
     }
   }
 
@@ -154,7 +294,15 @@ export class LiveManager {
   }
 
   private async handleMessage(message: LiveServerMessage) {
-    if (!this.outputAudioContext || !this.outputNode) return;
+    // Handle Input Transcription
+    if (message.serverContent?.inputTranscription) {
+      const text = message.serverContent.inputTranscription.text;
+      if (text) {
+        this.onTranscription(text);
+      }
+    }
+
+    if (!this.outputAudioContext || !this.fxInput) return;
 
     const base64Audio = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
     
@@ -173,7 +321,9 @@ export class LiveManager {
         
         const source = this.outputAudioContext.createBufferSource();
         source.buffer = audioBuffer;
-        source.connect(this.outputNode);
+        
+        // CRITICAL: Connect source to FX Input chain instead of directly to outputNode
+        source.connect(this.fxInput);
         
         source.addEventListener('ended', () => {
           this.activeSources.delete(source);
@@ -224,6 +374,10 @@ export class LiveManager {
         this.processor = null;
     }
     
+    // Cleanup FX nodes
+    this.activeFxNodes.forEach(n => { try { n.disconnect() } catch(e) {} });
+    this.activeFxNodes = [];
+
     if (this.inputAudioContext) {
         this.inputAudioContext.close();
         this.inputAudioContext = null;
